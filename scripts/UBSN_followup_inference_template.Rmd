@@ -1,0 +1,847 @@
+---
+title: "UBSN ROI Follow-up Inference"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "tidyverse",
+  "lme4",
+  "lmerTest",
+  "emmeans",
+  "broom",
+  "broom.mixed",
+  "openxlsx",
+  "patchwork",
+  "scales"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Please install these R packages before running this Rmd: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(broom)
+library(broom.mixed)
+library(openxlsx)
+library(patchwork)
+library(scales)
+
+theme_set(theme_bw(base_size = 13))
+
+project_dir <- "CHANGE_THIS_TO_YOUR_PROJECT_DIR"
+base_dir <- file.path(project_dir, "UBSN_abstract_outputs", "tables")
+output_root <- file.path(project_dir, "UBSN_followup_inference_outputs")
+table_dir <- file.path(output_root, "tables")
+figure_dir <- file.path(output_root, "figures")
+
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+enc_long <- read.csv(file.path(base_dir, "subject_level_encoding_long.csv"))
+tsc_long <- read.csv(file.path(base_dir, "subject_level_tsc_long.csv"))
+network_summary <- read.csv(file.path(base_dir, "network_summary_master.csv"))
+parcel_summary <- read.csv(file.path(base_dir, "parcel_summary_master.csv"))
+
+enc_long <- enc_long %>%
+  mutate(
+    roi = factor(roi),
+    condition = factor(condition, levels = c("raw", "srm"))
+  )
+
+tsc_long <- tsc_long %>%
+  mutate(
+    roi = factor(roi),
+    condition = factor(condition, levels = c("anatomical", "shared"))
+  )
+
+write_xlsx_safe <- function(x, path, sheet_name = "Sheet1") {
+  if (inherits(x, "list")) {
+    write.xlsx(x, file = path, overwrite = TRUE)
+  } else {
+    write.xlsx(setNames(list(as.data.frame(x)), sheet_name), file = path, overwrite = TRUE)
+  }
+}
+
+extract_fixed_effects_table <- function(model) {
+  anova_tbl <- as.data.frame(anova(model))
+  anova_tbl <- tibble::rownames_to_column(anova_tbl, var = "fixed_effect")
+  names(anova_tbl) <- gsub("\\.", "_", names(anova_tbl))
+  anova_tbl
+}
+
+add_sig_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ ""
+  )
+}
+
+fmt5 <- function(x) {
+  ifelse(is.na(x), NA_character_, sprintf("%.5f", x))
+}
+
+format_p5 <- function(p) {
+  ifelse(
+    is.na(p), NA,
+    ifelse(p < 0.00001, "<0.00001", sprintf("%.5f", p))
+  )
+}
+
+format_p_with_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "",
+    p < 0.00001 ~ "<0.00001***",
+    p < 0.001 ~ paste0(sprintf("%.5f", p), "***"),
+    p < 0.01 ~ paste0(sprintf("%.5f", p), "**"),
+    p < 0.05 ~ paste0(sprintf("%.5f", p), "*"),
+    TRUE ~ sprintf("%.5f", p)
+  )
+}
+
+format_numeric_table <- function(df, cols = NULL) {
+  out <- as.data.frame(df)
+  if (is.null(cols)) {
+    cols <- names(out)[vapply(out, is.numeric, logical(1))]
+  }
+  for (col in cols) {
+    if (col %in% names(out)) {
+      out[[col]] <- fmt5(out[[col]])
+    }
+  }
+  out
+}
+```
+
+# Overview
+
+This document performs formal follow-up inference for the UBSN ROI project.
+
+Main goals:
+
+1. Test **within-network** improvement from raw to SRM-reconstructed encoding.
+2. Test **within-network** improvement from anatomical to shared-space SRM TSC.
+3. Fit **mixed-effects models** across all networks with subject as a repeated factor.
+4. Export publication-ready fixed-effects tables, paired-test tables, and emmeans/post hoc tables.
+
+# 1. Descriptive Network Summary
+
+```{r descriptive-network-summary}
+network_overview <- network_summary %>%
+  select(
+    roi,
+    n_selected_parcels,
+    n_voxels,
+    srm_shared_mean_tsc,
+    raw_group_mean_r,
+    srm_group_mean_r,
+    encoding_subject_delta_mean_r,
+    subjects_improved,
+    pct_improved
+  ) %>%
+  arrange(desc(srm_shared_mean_tsc))
+
+network_overview
+
+write_xlsx_safe(
+  network_overview,
+  file.path(table_dir, "network_overview_summary.xlsx"),
+  sheet_name = "network_overview"
+)
+```
+
+# 2. Within-Network Paired Tests
+
+## 2.1 Encoding: Raw vs SRM
+
+```{r paired-tests-encoding}
+paired_encoding <- enc_long %>%
+  select(roi, subject_index, condition, mean_r) %>%
+  pivot_wider(names_from = condition, values_from = mean_r) %>%
+  group_by(roi) %>%
+  summarise(
+    t_test = list(t.test(srm, raw, paired = TRUE)),
+    mean_raw = mean(raw),
+    mean_srm = mean(srm),
+    mean_delta = mean(srm - raw),
+    sd_delta = sd(srm - raw),
+    cohens_d_paired = mean(srm - raw) / sd(srm - raw),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    t_stat = map_dbl(t_test, ~ unname(.x$statistic)),
+    df = map_dbl(t_test, ~ unname(.x$parameter)),
+    p_value = map_dbl(t_test, ~ .x$p.value),
+    conf_low = map_dbl(t_test, ~ .x$conf.int[1]),
+    conf_high = map_dbl(t_test, ~ .x$conf.int[2]),
+    p_fdr = p.adjust(p_value, method = "fdr"),
+    significance = add_sig_stars(p_fdr)
+  ) %>%
+  select(
+    roi, mean_raw, mean_srm, mean_delta, sd_delta, cohens_d_paired,
+    t_stat, df, p_value, p_fdr, conf_low, conf_high, significance
+  ) %>%
+  arrange(desc(mean_delta))
+
+paired_encoding_display <- format_numeric_table(paired_encoding)
+paired_encoding_display
+
+write_xlsx_safe(
+  paired_encoding_display,
+  file.path(table_dir, "paired_tests_encoding_raw_vs_srm.xlsx"),
+  sheet_name = "paired_encoding"
+)
+```
+
+## 2.2 SRM TSC: Anatomical vs Shared
+
+```{r paired-tests-tsc}
+paired_tsc <- tsc_long %>%
+  select(roi, subject_index, condition, accuracy) %>%
+  pivot_wider(names_from = condition, values_from = accuracy) %>%
+  group_by(roi) %>%
+  summarise(
+    t_test = list(t.test(shared, anatomical, paired = TRUE)),
+    mean_anatomical = mean(anatomical),
+    mean_shared = mean(shared),
+    mean_delta = mean(shared - anatomical),
+    sd_delta = sd(shared - anatomical),
+    cohens_d_paired = mean(shared - anatomical) / sd(shared - anatomical),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    t_stat = map_dbl(t_test, ~ unname(.x$statistic)),
+    df = map_dbl(t_test, ~ unname(.x$parameter)),
+    p_value = map_dbl(t_test, ~ .x$p.value),
+    conf_low = map_dbl(t_test, ~ .x$conf.int[1]),
+    conf_high = map_dbl(t_test, ~ .x$conf.int[2]),
+    p_fdr = p.adjust(p_value, method = "fdr"),
+    significance = add_sig_stars(p_fdr)
+  ) %>%
+  select(
+    roi, mean_anatomical, mean_shared, mean_delta, sd_delta, cohens_d_paired,
+    t_stat, df, p_value, p_fdr, conf_low, conf_high, significance
+  ) %>%
+  arrange(desc(mean_delta))
+
+paired_tsc_display <- format_numeric_table(paired_tsc)
+paired_tsc_display
+
+write_xlsx_safe(
+  paired_tsc_display,
+  file.path(table_dir, "paired_tests_tsc_anatomical_vs_shared.xlsx"),
+  sheet_name = "paired_tsc"
+)
+```
+
+# 3. Mixed-Effects Models
+
+## 3.1 Encoding Model
+
+```{r mixed-encoding}
+enc_model_df <- enc_long %>%
+  rename(
+    `LLM encoding` = condition,
+    Network = roi
+  ) %>%
+  mutate(
+    `LLM encoding` = factor(
+      `LLM encoding`,
+      levels = c("raw", "srm"),
+      labels = c("Raw + LLM", "SRM + LLM")
+    ),
+    Network = factor(Network)
+  )
+
+model_encoding <- lmer(
+  mean_r ~ `LLM encoding` * Network + (1 | subject_index),
+  data = enc_model_df
+)
+
+encoding_fixed_effects <- extract_fixed_effects_table(model_encoding) %>%
+  rename(
+    effect = fixed_effect,
+    numDF = NumDF,
+    denDF = DenDF,
+    F_value = `F value`,
+    p_value = `Pr(>F)`
+  ) %>%
+  mutate(
+    effect = case_when(
+      effect %in% c("`LLM encoding`", "LLM encoding") ~ "Raw + LLM vs SRM + LLM",
+      effect == "Network" ~ "Network",
+      effect %in% c("`LLM encoding`:Network", "LLM encoding:Network") ~ "(Raw + LLM vs SRM + LLM) x Network",
+      TRUE ~ effect
+    ),
+    significance = add_sig_stars(p_value),
+    p_value_print = format_p5(p_value)
+  )
+
+encoding_fixed_effects_display <- format_numeric_table(encoding_fixed_effects)
+encoding_fixed_effects_display
+
+write_xlsx_safe(
+  list(
+    fixed_effects = encoding_fixed_effects_display,
+    model_coefficients = format_numeric_table(broom.mixed::tidy(model_encoding, effects = "fixed")),
+    random_effects = format_numeric_table(broom.mixed::tidy(model_encoding, effects = "ran_pars"))
+  ),
+  file.path(table_dir, "mixed_model_encoding_results.xlsx")
+)
+```
+
+## 3.2 SRM TSC Model
+
+```{r mixed-tsc}
+tsc_model_df <- tsc_long %>%
+  rename(
+    `Alignment method` = condition,
+    Network = roi
+  ) %>%
+  mutate(
+    `Alignment method` = factor(
+      `Alignment method`,
+      levels = c("anatomical", "shared"),
+      labels = c("Anatomical alignment", "SRM shared space")
+    ),
+    Network = factor(Network)
+  )
+
+model_tsc <- lmer(
+  accuracy ~ `Alignment method` * Network + (1 | subject_index),
+  data = tsc_model_df
+)
+
+tsc_fixed_effects <- extract_fixed_effects_table(model_tsc) %>%
+  rename(
+    effect = fixed_effect,
+    numDF = NumDF,
+    denDF = DenDF,
+    F_value = `F value`,
+    p_value = `Pr(>F)`
+  ) %>%
+  mutate(
+    effect = case_when(
+      effect %in% c("`Alignment method`", "Alignment method") ~ "Anatomical alignment vs SRM shared space",
+      effect == "Network" ~ "Network",
+      effect %in% c("`Alignment method`:Network", "Alignment method:Network") ~ "(Anatomical alignment vs SRM shared space) x Network",
+      TRUE ~ effect
+    ),
+    significance = add_sig_stars(p_value),
+    p_value_print = format_p5(p_value)
+  )
+
+tsc_fixed_effects_display <- format_numeric_table(tsc_fixed_effects)
+tsc_fixed_effects_display
+
+write_xlsx_safe(
+  list(
+    fixed_effects = tsc_fixed_effects_display,
+    model_coefficients = format_numeric_table(broom.mixed::tidy(model_tsc, effects = "fixed")),
+    random_effects = format_numeric_table(broom.mixed::tidy(model_tsc, effects = "ran_pars"))
+  ),
+  file.path(table_dir, "mixed_model_tsc_results.xlsx")
+)
+```
+
+# 4. EMMEANS and Post Hoc Tables
+
+## 4.1 Encoding EMMEANS
+
+```{r emmeans-encoding}
+
+emmeans_encoding <- emmeans(model_encoding, ~ `LLM encoding` | Network)
+
+emmeans_encoding_summary <- summary(emmeans_encoding) %>%
+  as.data.frame() %>%
+  mutate(
+    df = suppressWarnings(as.numeric(df)),
+    p_value_print = if ("p.value" %in% names(.)) format_p5(p.value) else NA
+  )
+
+emmeans_encoding_pairs <- pairs(emmeans_encoding, adjust = "fdr") %>%
+  summary() %>%
+  as.data.frame() %>%
+  mutate(
+    df = suppressWarnings(as.numeric(df)),
+    p_value_print = if ("p.value" %in% names(.)) format_p5(p.value) else NA
+  )
+
+emmeans_encoding_summary_display <- format_numeric_table(emmeans_encoding_summary)
+emmeans_encoding_pairs_display <- format_numeric_table(emmeans_encoding_pairs)
+
+emmeans_encoding_summary_display
+emmeans_encoding_pairs_display
+
+write_xlsx_safe(
+  list(
+    emmeans = emmeans_encoding_summary_display,
+    pairwise_contrasts = emmeans_encoding_pairs_display
+  ),
+  file.path(table_dir, "emmeans_encoding_results.xlsx")
+)
+```
+
+## 4.2 TSC EMMEANS
+
+```{r emmeans-tsc}
+emmeans_tsc <- emmeans(model_tsc, ~ `Alignment method` | Network)
+
+emmeans_tsc_summary <- summary(emmeans_tsc) %>%
+  as.data.frame() %>%
+  mutate(
+    df = suppressWarnings(as.numeric(df)),
+    p_value_print = if ("p.value" %in% names(.)) format_p5(p.value) else NA
+  )
+
+emmeans_tsc_pairs <- pairs(emmeans_tsc, adjust = "fdr") %>%
+  summary() %>%
+  as.data.frame() %>%
+  mutate(
+    df = suppressWarnings(as.numeric(df)),
+    p_value_print = if ("p.value" %in% names(.)) format_p5(p.value) else NA
+  )
+
+emmeans_tsc_summary_display <- format_numeric_table(emmeans_tsc_summary)
+emmeans_tsc_pairs_display <- format_numeric_table(emmeans_tsc_pairs)
+
+emmeans_tsc_summary_display
+emmeans_tsc_pairs_display
+
+write_xlsx_safe(
+  list(
+    emmeans = emmeans_tsc_summary_display,
+    pairwise_contrasts = emmeans_tsc_pairs_display
+  ),
+  file.path(table_dir, "emmeans_tsc_results.xlsx")
+)
+```
+
+# 5. Publication-Style Tables
+
+## 5.1 Type III ANOVA Tables
+
+```{r publication-type3-tables}
+encoding_type3_table <- encoding_fixed_effects %>%
+  mutate(
+    Factor = effect,
+    `Sum Sq` = if ("Sum Sq" %in% names(.)) round(`Sum Sq`, 3) else NA_real_,
+    NumDF = round(numDF, 3),
+    DenDF = round(denDF, 3),
+    `F-value` = round(F_value, 3),
+    `p-value` = format_p_with_stars(p_value)
+  ) %>%
+  select(
+    Factor,
+    `Sum Sq`,
+    NumDF,
+    DenDF,
+    `F-value`,
+    `p-value`
+  )
+
+tsc_type3_table <- tsc_fixed_effects %>%
+  mutate(
+    Factor = effect,
+    `Sum Sq` = if ("Sum Sq" %in% names(.)) round(`Sum Sq`, 3) else NA_real_,
+    NumDF = round(numDF, 3),
+    DenDF = round(denDF, 3),
+    `F-value` = round(F_value, 3),
+    `p-value` = format_p_with_stars(p_value)
+  ) %>%
+  select(
+    Factor,
+    `Sum Sq`,
+    NumDF,
+    DenDF,
+    `F-value`,
+    `p-value`
+  )
+
+encoding_type3_table
+tsc_type3_table
+
+write_xlsx_safe(
+  list(
+    encoding_type3_anova = encoding_type3_table,
+    tsc_type3_anova = tsc_type3_table
+  ),
+  file.path(table_dir, "tables_type3_anova.xlsx")
+)
+```
+
+## 5.2 EMMEANS Post Hoc Tables
+
+```{r publication-emmeans-posthoc}
+
+encoding_posthoc_table <- emmeans_encoding_pairs %>%
+  mutate(
+    Network = Network,
+    Contrast = contrast,
+    Estimate = round(estimate, 5),
+    SE = round(SE, 5),
+    df = round(df, 3),
+    `t.ratio` = round(t.ratio, 3),
+    `p-value` = format_p_with_stars(p.value)
+  ) %>%
+  mutate(
+    SRM_plus_LLM_minus_Raw_plus_LLM = case_when(
+      Contrast %in% c("Raw + LLM - SRM + LLM", "(Raw + LLM) - (SRM + LLM)") ~ round(-estimate, 5),
+      Contrast %in% c("SRM + LLM - Raw + LLM", "(SRM + LLM) - (Raw + LLM)") ~ round(estimate, 5),
+      TRUE ~ NA_real_
+    ),
+    Direction = case_when(
+      p.value < 0.05 & SRM_plus_LLM_minus_Raw_plus_LLM > 0 ~ "SRM + LLM > Raw + LLM",
+      p.value < 0.05 & SRM_plus_LLM_minus_Raw_plus_LLM < 0 ~ "Raw + LLM > SRM + LLM",
+      TRUE ~ "No significant difference"
+    )
+  ) %>%
+  select(
+    Network,
+    Contrast,
+    Estimate,
+    SRM_plus_LLM_minus_Raw_plus_LLM,
+    SE,
+    df,
+    `t.ratio`,
+    `p-value`,
+    Direction
+  )
+
+tsc_posthoc_table <- emmeans_tsc_pairs %>%
+  mutate(
+    Network = Network,
+    Contrast = contrast,
+    Estimate = round(estimate, 5),
+    SE = round(SE, 5),
+    df = round(df, 3),
+    `t.ratio` = round(t.ratio, 3),
+    `p-value` = format_p_with_stars(p.value)
+  ) %>%
+  mutate(
+    SRM_shared_space_minus_Anatomical_alignment = case_when(
+      Contrast == "Anatomical alignment - SRM shared space" ~ round(-estimate, 5),
+      Contrast == "SRM shared space - Anatomical alignment" ~ round(estimate, 5),
+      TRUE ~ NA_real_
+    ),
+    Direction = case_when(
+      p.value < 0.05 & SRM_shared_space_minus_Anatomical_alignment > 0 ~ 
+        "SRM shared space > Anatomical alignment",
+      p.value < 0.05 & SRM_shared_space_minus_Anatomical_alignment < 0 ~ 
+        "Anatomical alignment > SRM shared space",
+      TRUE ~ "No significant difference"
+    )
+  ) %>%
+  select(
+    Network,
+    Contrast,
+    Estimate,
+    SRM_shared_space_minus_Anatomical_alignment,
+    SE,
+    df,
+    `t.ratio`,
+    `p-value`,
+    Direction
+  )
+
+encoding_posthoc_table
+tsc_posthoc_table
+
+write_xlsx_safe(
+  list(
+    encoding_posthoc = encoding_posthoc_table,
+    tsc_posthoc = tsc_posthoc_table
+  ),
+  file.path(table_dir, "tables_emmeans_posthoc.xlsx")
+)
+```
+
+# 6. Cross-Network Association Tests
+
+```{r cross-network-correlation}
+cor_tsc_vs_srm_encoding <- cor.test(
+  network_summary$srm_shared_mean_tsc,
+  network_summary$srm_group_mean_r,
+  method = "pearson"
+)
+
+cor_tsc_vs_encoding_delta <- cor.test(
+  network_summary$srm_shared_mean_tsc,
+  network_summary$encoding_subject_delta_mean_r,
+  method = "pearson"
+)
+
+cor_raw_vs_srm_encoding <- cor.test(
+  network_summary$raw_group_mean_r,
+  network_summary$srm_group_mean_r,
+  method = "pearson"
+)
+
+correlation_table <- tibble(
+  comparison = c(
+    "SRM shared TSC vs SRM+LLM encoding",
+    "SRM shared TSC vs subject-level encoding delta",
+    "Raw LLM encoding vs SRM+LLM encoding"
+  ),
+  estimate = c(
+    unname(cor_tsc_vs_srm_encoding$estimate),
+    unname(cor_tsc_vs_encoding_delta$estimate),
+    unname(cor_raw_vs_srm_encoding$estimate)
+  ),
+  p_value = c(
+    cor_tsc_vs_srm_encoding$p.value,
+    cor_tsc_vs_encoding_delta$p.value,
+    cor_raw_vs_srm_encoding$p.value
+  ),
+  conf_low = c(
+    cor_tsc_vs_srm_encoding$conf.int[1],
+    cor_tsc_vs_encoding_delta$conf.int[1],
+    cor_raw_vs_srm_encoding$conf.int[1]
+  ),
+  conf_high = c(
+    cor_tsc_vs_srm_encoding$conf.int[2],
+    cor_tsc_vs_encoding_delta$conf.int[2],
+    cor_raw_vs_srm_encoding$conf.int[2]
+  )
+) %>%
+  mutate(significance = add_sig_stars(p_value))
+
+correlation_table_display <- format_numeric_table(correlation_table)
+correlation_table_display
+
+write_xlsx_safe(
+  correlation_table_display,
+  file.path(table_dir, "cross_network_correlations.xlsx"),
+  sheet_name = "correlations"
+)
+```
+
+# 7. Statistical Figures
+
+## 6.1 Network-level Encoding Improvement
+
+```{r fig-encoding-delta, fig.width=11, fig.height=7}
+fig_encoding_delta_df <- paired_encoding %>%
+  arrange(desc(mean_delta)) %>%
+  mutate(roi = factor(roi, levels = rev(roi)))
+
+p_encoding_delta <- ggplot(fig_encoding_delta_df, aes(x = mean_delta, y = roi)) +
+  geom_col(fill = "#E07A5F") +
+  geom_errorbarh(aes(xmin = conf_low, xmax = conf_high), height = 0.18, color = "black") +
+  labs(
+    title = "Subject-level Paired Encoding Improvement by Network (SRM - Raw)",
+    x = "Mean subject-level paired delta r (SRM + LLM - Raw + LLM)",
+    y = NULL
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_encoding_delta
+
+ggsave(
+  filename = file.path(figure_dir, "network_encoding_improvement_barplot.png"),
+  plot = p_encoding_delta,
+  width = 11,
+  height = 7,
+  dpi = 300
+)
+```
+
+## 6.2 Network-level SRM TSC Improvement
+
+```{r fig-tsc-delta, fig.width=11, fig.height=7}
+fig_tsc_delta_df <- paired_tsc %>%
+  arrange(desc(mean_delta)) %>%
+  mutate(roi = factor(roi, levels = rev(roi)))
+
+p_tsc_delta <- ggplot(fig_tsc_delta_df, aes(x = mean_delta, y = roi)) +
+  geom_col(fill = "#3D5A80") +
+  geom_errorbarh(aes(xmin = conf_low, xmax = conf_high), height = 0.18, color = "black") +
+  labs(
+  title = "Subject-level Paired SRM Alignment Improvement by Network",
+  x = "Mean subject-level paired delta accuracy (SRM shared space - anatomical alignment)",
+  y = NULL
+) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_tsc_delta
+
+ggsave(
+  filename = file.path(figure_dir, "network_tsc_improvement_barplot.png"),
+  plot = p_tsc_delta,
+  width = 11,
+  height = 7,
+  dpi = 300
+)
+```
+
+## 6.3 Subject-level Raw vs SRM Encoding by Network
+
+```{r fig-encoding-box, fig.width=14, fig.height=8}
+fig_encoding_box_df <- enc_long %>%
+  mutate(
+    `LLM encoding` = factor(
+      condition,
+      levels = c("raw", "srm"),
+      labels = c("Raw + LLM", "SRM + LLM")
+    )
+  )
+
+p_encoding_box <- ggplot(fig_encoding_box_df, aes(x = `LLM encoding`, y = mean_r, fill = `LLM encoding`)) +
+  geom_boxplot(width = 0.65, outlier.shape = NA, alpha = 0.75) +
+  geom_jitter(width = 0.08, alpha = 0.25, size = 0.9) +
+  facet_wrap(~ roi, scales = "free_y") +
+  scale_fill_manual(values = c("Raw + LLM" = "#8DA0CB", "SRM + LLM" = "#FC8D62")) +
+  labs(
+    title = "Subject-level Encoding Performance Across Networks",
+    x = NULL,
+    y = "Mean encoding r"
+  ) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(size = 9)
+  )
+
+p_encoding_box
+
+ggsave(
+  filename = file.path(figure_dir, "subject_level_encoding_boxplots.png"),
+  plot = p_encoding_box,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+```
+
+## 6.4 Subject-level TSC by Network
+
+```{r fig-tsc-box, fig.width=14, fig.height=8}
+fig_tsc_box_df <- tsc_long %>%
+  mutate(
+    `Alignment method` = factor(
+      condition,
+      levels = c("anatomical", "shared"),
+      labels = c("Anatomical alignment", "SRM shared space")
+    )
+  )
+
+p_tsc_box <- ggplot(fig_tsc_box_df, aes(x = `Alignment method`, y = accuracy, fill = `Alignment method`)) +
+  geom_boxplot(width = 0.65, outlier.shape = NA, alpha = 0.75) +
+  geom_jitter(width = 0.08, alpha = 0.25, size = 0.9) +
+  facet_wrap(~ roi, scales = "free_y") +
+  scale_fill_manual(values = c("Anatomical alignment" = "#A6CEE3", "SRM shared space" = "#1F78B4")) +
+  labs(
+    title = "Subject-level SRM TSC Performance Across Networks",
+    x = NULL,
+    y = "TSC accuracy"
+  ) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(size = 9)
+  )
+
+p_tsc_box
+
+ggsave(
+  filename = file.path(figure_dir, "subject_level_tsc_boxplots.png"),
+  plot = p_tsc_box,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+```
+
+## 6.5 Cross-Network Scatterplots
+
+```{r fig-cross-network, fig.width=14, fig.height=6}
+library(patchwork)
+
+p_cross_1 <- ggplot(
+  network_summary,
+  aes(x = srm_shared_mean_tsc, y = srm_group_mean_r, color = roi)
+) +
+  geom_point(size = 3.3) +
+  geom_smooth(method = "lm", se = FALSE, color = "grey35", linewidth = 0.8) +
+  labs(
+    title = "SRM TSC Accuracy vs SRM + LLM Encoding",
+    x = "Shared-space TSC accuracy",
+    y = "SRM + LLM group mean encoding r",
+    color = "Network"
+  ) +
+  theme(legend.position = "bottom")
+
+p_cross_2 <- ggplot(
+  network_summary,
+  aes(x = raw_group_mean_r, y = srm_group_mean_r, color = roi)
+) +
+  geom_point(size = 3.3) +
+  geom_smooth(method = "lm", se = FALSE, color = "grey35", linewidth = 0.8) +
+  labs(
+    title = "Raw LLM Encoding vs SRM + LLM Encoding",
+    x = "Raw group mean encoding r",
+    y = "SRM + LLM group mean encoding r",
+    color = "Network"
+  ) +
+  theme(legend.position = "bottom")
+
+p_cross <- p_cross_1 + p_cross_2 +
+  plot_layout(guides = "collect") +
+  plot_annotation(theme = theme(legend.position = "bottom"))
+
+p_cross
+
+ggsave(
+  filename = file.path(figure_dir, "cross_network_scatterplots.png"),
+  plot = p_cross,
+  width = 14,
+  height = 6,
+  dpi = 300
+)
+```
+
+# 8. Optional Parcel-Level Descriptive Follow-up
+
+```{r parcel-followup}
+parcel_top20_srm <- parcel_summary %>%
+  arrange(desc(srm_group_mean_r)) %>%
+  select(roi, parcel_id, parcel_name, voxel_count, srm_group_mean_r) %>%
+  head(20)
+
+parcel_top20_raw <- parcel_summary %>%
+  arrange(desc(raw_group_mean_r)) %>%
+  select(roi, parcel_id, parcel_name, voxel_count, raw_group_mean_r) %>%
+  head(20)
+
+parcel_top20_delta <- parcel_summary %>%
+  arrange(desc(delta_group_mean_r)) %>%
+  select(roi, parcel_id, parcel_name, voxel_count, delta_group_mean_r) %>%
+  head(20)
+
+write_xlsx_safe(
+  list(
+    top20_srm_encoding = parcel_top20_srm,
+    top20_raw_encoding = parcel_top20_raw,
+    top20_delta_encoding = parcel_top20_delta
+  ),
+  file.path(table_dir, "parcel_top20_followup_tables.xlsx")
+)
+
+parcel_top20_srm
+parcel_top20_raw
+parcel_top20_delta
+```
+
